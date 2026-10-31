@@ -1,0 +1,335 @@
+name: WhiteVPN Desktop Release Builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Desktop release version. Defaults to the v* tag suffix or the Makefile default."
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: whitevpn-desktop-macos-amd64
+            os: macos-latest
+            kind: macos
+            platform: darwin/amd64
+            arch: amd64
+          - artifact: whitevpn-desktop-macos-arm64
+            os: macos-latest
+            kind: macos
+            platform: darwin/arm64
+            arch: arm64
+          - artifact: whitevpn-desktop-windows-x64
+            os: macos-latest
+            kind: windows
+            platform: windows/amd64
+            arch: amd64
+          - artifact: whitevpn-desktop-windows-arm64-windows-on-arm
+            os: macos-latest
+            kind: windows
+            platform: windows/arm64
+            arch: arm64
+          # The unsuffixed name is the current one, on both architectures.
+          # It used to be the WebKitGTK 4.0 build here and the 4.1 build on
+          # arm64 — the same name meaning opposite things, with the amd64 half
+          # being the one everybody clicks. On Ubuntu 24.04 and later, where
+          # only libwebkit2gtk-4.1-0 exists, that download cannot install.
+          - artifact: whitevpn-desktop-linux-amd64
+            os: ubuntu-24.04
+            kind: linux
+            platform: linux/amd64
+            arch: amd64
+            webkit: "4.1"
+            linux_tags: webkit2_41
+            package_formats: deb,rpm,appimage
+          # Kept for Ubuntu 22.04 and Debian 12, and named for what it needs
+          # rather than left as the default anybody would reach for first.
+          - artifact: whitevpn-desktop-linux-amd64-webkit40
+            os: ubuntu-22.04
+            kind: linux
+            platform: linux/amd64
+            arch: amd64
+            webkit: "4.0"
+            linux_tags: ""
+            package_formats: deb,rpm
+          - artifact: whitevpn-desktop-linux-arm64
+            os: ubuntu-24.04-arm
+            kind: linux
+            platform: linux/arm64
+            arch: arm64
+            webkit: "4.1"
+            linux_tags: webkit2_41
+            package_formats: deb,rpm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: Resolve desktop version
+        id: desktop-version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          version="$INPUT_VERSION"
+          if [ -z "$version" ] && [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$version" ]; then
+            version="1.0.0-beta2"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.5"
+          cache: true
+          cache-dependency-path: |
+            desktop/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.webkit }}" = "4.1" ]; then
+            sudo apt-get install -y build-essential curl file pkg-config rpm libgtk-3-dev libwebkit2gtk-4.1-dev
+          else
+            sudo apt-get install -y build-essential curl file pkg-config rpm libgtk-3-dev libwebkit2gtk-4.0-dev
+          fi
+          # linuxdeploy and appimagetool are themselves AppImages and want FUSE
+          # to mount. 24.04 ships neither libfuse2 nor the old name, so try both
+          # and carry on if neither exists: only the AppImage format needs it.
+          sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2 || true
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix desktop/frontend
+
+      - name: Install Wails CLI
+        working-directory: desktop
+        run: |
+          WAILS_VERSION="$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)"
+          go install "github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VERSION}"
+
+      - name: Build package
+        shell: bash
+        # The catalogue's address and key. They were constants in a public file
+        # until now, which meant anyone could decrypt the node list without so
+        # much as downloading the app. A release built without these secrets set
+        # produces a working client with no built-in catalogue rather than
+        # failing, so a fork can build one and nothing here has to be faked.
+        env:
+          WHITEVPN_CATALOGUE_URL: ${{ secrets.WHITEVPN_CATALOGUE_URL }}
+          WHITEVPN_CATALOGUE_KEY: ${{ secrets.WHITEVPN_CATALOGUE_KEY }}
+          WHITEVPN_PRIVATE_CATALOGUE_URL: ${{ secrets.WHITEVPN_PRIVATE_CATALOGUE_URL }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.kind }}" in
+            macos)
+              make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-mac MACOS_PLATFORMS="${{ matrix.platform }}" MACOS_CLIENT_ARCH="${{ matrix.arch }}"
+              ;;
+            windows)
+              make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-windows WINDOWS_PLATFORMS="${{ matrix.platform }}" WINDOWS_CLIENT_ARCH="${{ matrix.arch }}"
+              ;;
+            linux)
+              make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-linux LINUX_PLATFORMS="${{ matrix.platform }}" LINUX_CLIENT_ARCH="${{ matrix.arch }}" LINUX_GO_TAGS="${{ matrix.linux_tags }}"
+              ;;
+          esac
+          make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" stage-artifacts PLATFORM="${{ matrix.artifact }}"
+
+      - name: Archive package
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          source_dir="desktop/build/releases/${{ matrix.artifact }}"
+          desktop_version="${{ steps.desktop-version.outputs.version }}"
+          asset_platform="${{ matrix.artifact }}"
+          asset_platform="${asset_platform#whitevpn-desktop-}"
+          paths=""
+          case "${{ matrix.kind }}" in
+            macos)
+              archive="desktop/build/releases/WhiteVPN-Desktop-${desktop_version}-${asset_platform}.zip"
+              (cd "$source_dir" && ditto -c -k --sequesterRsrc --keepParent "WhiteVPN Desktop.app" "../$(basename "$archive")")
+              paths="$archive"
+              ;;
+            windows)
+              archive="desktop/build/releases/WhiteVPN-Desktop-${desktop_version}-${asset_platform}.zip"
+              (cd "$source_dir" && zip -qry "../$(basename "$archive")" .)
+              paths="$archive"
+              ;;
+            linux)
+              archive="desktop/build/releases/WhiteVPN-Desktop-${desktop_version}-${asset_platform}.tar.gz"
+              tar -czf "$archive" -C "$source_dir" .
+              package_formats="${{ matrix.package_formats }}"
+              if [ -z "$package_formats" ]; then
+                package_formats="deb,rpm"
+              fi
+              APP_NAME="WhiteVPN Desktop" \
+                VERSION="$desktop_version" \
+                PACKAGE_SOURCE_DIR="build/releases/${{ matrix.artifact }}" \
+                PACKAGE_OUTPUT_DIR="build/releases" \
+                LINUX_ARCH="${{ matrix.arch }}" \
+                LINUX_WEBKIT="${{ matrix.webkit }}" \
+                LINUX_ASSET_SUFFIX="$asset_platform" \
+                LINUX_PACKAGE_FORMATS="$package_formats" \
+                desktop/scripts/package-linux-dist.sh
+              paths="$archive"
+              for package in desktop/build/releases/WhiteVPN-Desktop-${desktop_version}-${asset_platform}.deb desktop/build/releases/WhiteVPN-Desktop-${desktop_version}-${asset_platform}.rpm; do
+                paths="${paths}"$'\n'"$package"
+              done
+              rpm_package="desktop/build/releases/WhiteVPN-Desktop-${desktop_version}-${asset_platform}.rpm"
+              if rpm -qpR "$rpm_package" | grep -E '^webkit2gtk4\.[01]($|[[:space:]])'; then
+                echo "RPM contains a hard-coded WebKitGTK package dependency" >&2
+                exit 1
+              fi
+              if [[ ",$package_formats," == *",appimage,"* ]]; then
+                appimage="desktop/build/releases/WhiteVPN-Desktop-${desktop_version}-${asset_platform}.AppImage"
+                test -x "$appimage"
+                paths="${paths}"$'\n'"$appimage"
+              fi
+              ;;
+          esac
+          {
+            echo "paths<<EOF"
+            printf '%s\n' "$paths"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$paths" | xargs ls -lh
+
+      - name: Upload package
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.archive.outputs.paths }}
+          if-no-files-found: error
+
+  # The MSI cannot be cross-compiled. WiX is a .NET tool that only produces MSIs
+  # on Windows, while every other Windows artifact here is built on macOS — so
+  # this job takes the executable the build already produced and wraps it,
+  # rather than building the app a second time.
+  msi:
+    name: whitevpn-desktop-windows-msi
+    needs: build
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: whitevpn-desktop-windows-x64
+            arch: x64
+          - artifact: whitevpn-desktop-windows-arm64-windows-on-arm
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve desktop version
+        id: desktop-version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          version="$INPUT_VERSION"
+          if [ -z "$version" ] && [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$version" ]; then
+            version="1.0.0-beta2"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download the built application
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: downloaded
+
+      - name: Install WiX
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pinned to v5: v7 refuses to run without accepting the Open Source
+          # Maintenance Fee EULA, which is a licensing decision and not one a
+          # build script should make on anybody's behalf.
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+
+      - name: Build the MSI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktop/build/bin
+          # The build job uploaded a zip; the MSI needs what is inside it.
+          unzip -o downloaded/*.zip -d desktop/build/bin
+          ls -lh desktop/build/bin
+          make -C desktop VERSION="${{ steps.desktop-version.outputs.version }}" package-windows-msi             MSI_ARCH="${{ matrix.arch }}"             MSI_ASSET_SUFFIX="$(echo '${{ matrix.artifact }}' | sed 's/^whitevpn-desktop-//')"
+          ls -lh desktop/build/releases/*.msi
+
+      - name: Upload the MSI
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.artifact }}-msi
+          path: desktop/build/releases/*.msi
+          if-no-files-found: error
+
+  publish:
+    name: Publish release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, msi]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: find release-assets -maxdepth 1 -type f -print | sort
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: release-assets/*
+          # A tag carrying a pre-release suffix — v1.0.21-rc1, v1.1.0-beta2 —
+          # publishes as a pre-release, and nothing else does.
+          #
+          # This is not housekeeping. The app's update check reads
+          # /releases/latest and refuses drafts and pre-releases, and GitHub
+          # leaves pre-releases out of that endpoint entirely. So the flag is
+          # what decides whether a tag pushed to try something out becomes an
+          # update prompt on every installation, and leaving it unset left that
+          # to the action's default rather than to the tag.
+          prerelease: ${{ contains(github.ref_name, '-') }}

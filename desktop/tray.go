@@ -1,0 +1,486 @@
+package main
+
+import (
+	"context"
+	_ "embed"
+	"fmt"
+	"runtime"
+	"strings"
+	"sync"
+
+	"fyne.io/systray"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
+
+	"whitevpn-desktop/internal/model"
+)
+
+// The tray icon, and what makes closing the window not the same as quitting.
+//
+// A VPN is not a document: closing its window means "get out of my way", not
+// "stop protecting my traffic". So the window hides and the app keeps running —
+// but only once there is a tray icon to bring it back from. If the tray never
+// came up, closing the window quits, because an app with no window and no icon
+// is one the user can only end through Task Manager.
+
+//go:embed build/windows/icon.ico
+var trayIconICO []byte
+
+//go:embed build/appicon.png
+var trayIconPNG []byte
+
+type trayState struct {
+	mu      sync.Mutex
+	ready   bool
+	refresh chan struct{}
+
+	status      *systray.MenuItem
+	toggle      *systray.MenuItem
+	systemProxy *systray.MenuItem
+	tunnel      *systray.MenuItem
+	show        *systray.MenuItem
+	quit        *systray.MenuItem
+	stopped     bool
+}
+
+// running reports whether there is an icon to restore the window from.
+func (t *trayState) running() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ready && !t.stopped
+}
+
+func (t *trayState) markReady(ready bool) {
+	t.mu.Lock()
+	t.ready = ready
+	t.mu.Unlock()
+}
+
+// startTray brings the icon up. It returns immediately; the icon appears when
+// the system is ready for it.
+func (a *App) startTray() {
+	a.tray.refresh = make(chan struct{}, 1)
+
+	// Registered before the icon is, not from inside the ready callback, and
+	// that ordering is the whole of whether a left click does anything on
+	// Linux. systray exports the icon's D-Bus properties as it starts, and one
+	// of them — ItemIsMenu — is read straight off whether a tap handler exists
+	// at that moment. The ready callback runs on its own goroutine alongside
+	// that export, so setting the handler there was a race with it: lose, and
+	// the icon announces itself as a menu and no host ever sends Activate.
+	//
+	// A left click is the shortest way back to the window; the menu stays on
+	// the right button, where the platform puts it.
+	systray.SetOnTapped(func() { a.showWindow() })
+
+	if runtime.GOOS == "darwin" {
+		systray.Register(a.onTrayReady, a.onTrayExit)
+		return
+	}
+	go func() {
+		// The icon's window and the loop that pumps its messages have to stay on
+		// one OS thread. Windows delivers a window's messages only to the thread
+		// that created it, and GetMessage reads the calling thread's queue — so a
+		// goroutine the scheduler moves between threads creates the window on one
+		// and then listens on another, where nothing ever arrives.
+		//
+		// systray locks the thread in its own init(), which covers a Run() on the
+		// main goroutine. Starting one with `go` steps outside that: the icon
+		// still appears, because it is created once, and then every click,
+		// every menu open and Quit itself go into a queue nobody reads. What the
+		// user sees is an icon that does nothing and an app that can only be
+		// ended from Task Manager.
+		//
+		// Not unlocked afterwards: the goroutine only returns once the tray has
+		// quit, and letting the thread die with it is better than handing a
+		// thread that owned a window back for general use.
+		runtime.LockOSThread()
+		systray.Run(a.onTrayReady, a.onTrayExit)
+	}()
+}
+
+func (a *App) onTrayReady() {
+	systray.SetIcon(trayIcon())
+	systray.SetTitle(trayAppName)
+	systray.SetTooltip(trayAppName)
+
+	words := a.trayStrings()
+	a.tray.status = systray.AddMenuItem(words.disconnected, "")
+	a.tray.status.Disable()
+	systray.AddSeparator()
+	a.tray.toggle = systray.AddMenuItem(words.connect, "")
+	systray.AddSeparator()
+	// The two mode switches, which behave differently for a reason the label
+	// has to carry: see toggleSystemProxyFromTray and toggleTunnelFromTray.
+	settings := a.GetAppState().WhiteVPN
+	a.tray.systemProxy = systray.AddMenuItemCheckbox(words.systemProxy, "", settings.SetSystemProxy)
+	a.tray.tunnel = systray.AddMenuItemCheckbox(words.tunnel, words.tunnelHint, settings.TunEnabled)
+	systray.AddSeparator()
+	a.tray.show = systray.AddMenuItem(words.show, "")
+	a.tray.quit = systray.AddMenuItem(words.quit, "")
+
+	a.tray.markReady(true)
+	a.refreshTray()
+
+	// Returning matters, and it is not obvious why. systray holds a WaitGroup
+	// that is only released when this callback returns, and on Linux the D-Bus
+	// method a host calls to read the menu — GetLayout — waits on it. So a
+	// callback that never returns is a menu that never arrives: the icon is
+	// drawn, the click is delivered, and the host is left waiting for a layout
+	// until it gives up. That is what "the tray icon does nothing" was.
+	//
+	// So the clicks are watched from a goroutine of their own. systray's menu
+	// items are safe to use from any goroutine; it is only this callback that
+	// has to finish.
+	go a.watchTrayClicks(a.tray.toggle.ClickedCh, a.tray.show.ClickedCh, a.tray.quit.ClickedCh,
+		a.tray.systemProxy.ClickedCh, a.tray.tunnel.ClickedCh)
+}
+
+// watchTrayClicks turns menu clicks into actions until the tray quits.
+//
+// The channels are passed in rather than read off a.tray, so that this loop can
+// be exercised without standing up a real icon — which needs a desktop session
+// and a bus, and so would only ever be tested by hand on the one platform where
+// it broke.
+func (a *App) watchTrayClicks(toggle, show, quit, systemProxy, tunnel <-chan struct{}) {
+	for {
+		select {
+		case <-toggle:
+			go a.toggleFromTray()
+		case <-systemProxy:
+			go a.toggleSystemProxyFromTray()
+		case <-tunnel:
+			go a.toggleTunnelFromTray()
+		case <-show:
+			a.showWindow()
+		case <-quit:
+			a.quitFromTray()
+			return
+		case <-a.tray.refresh:
+			a.refreshTray()
+		}
+	}
+}
+
+func (a *App) onTrayExit() {
+	a.tray.mu.Lock()
+	a.tray.stopped = true
+	a.tray.mu.Unlock()
+}
+
+// notifyTray asks the icon to re-read the runtime state. It never blocks: the
+// tray is a display, and a display that can hold up a connection is worse than
+// one that misses a frame.
+func (a *App) notifyTray() {
+	if a.tray.refresh == nil {
+		return
+	}
+	select {
+	case a.tray.refresh <- struct{}{}:
+	default:
+	}
+}
+
+func (a *App) refreshTray() {
+	if !a.tray.running() {
+		return
+	}
+	state := a.GetAppState()
+	words := a.trayStrings()
+
+	label := words.disconnected
+	toggle := words.connect
+	switch state.Runtime.Status {
+	case model.RuntimeConnected:
+		label = words.connected
+		toggle = words.disconnect
+		if country := state.Runtime.ExitCountryCode; country != "" {
+			label = words.connected + " — " + country
+		}
+	case model.RuntimeConnecting:
+		label, toggle = words.connecting, words.disconnect
+	case model.RuntimeStopping:
+		label, toggle = words.stopping, words.disconnect
+	case model.RuntimeFailed:
+		label, toggle = words.failed, words.retry
+	}
+
+	a.tray.status.SetTitle(label)
+	a.tray.toggle.SetTitle(toggle)
+	a.tray.show.SetTitle(words.show)
+	a.tray.quit.SetTitle(words.quit)
+	systray.SetTooltip(trayAppName + " — " + label)
+	// The colour says the same thing the tooltip does, without needing a hover.
+	systray.SetIcon(trayIconFor(state.Runtime.Status))
+
+	// Nothing to toggle while stopping, exactly as the button on the page.
+	if state.Runtime.Status == model.RuntimeStopping {
+		a.tray.toggle.Disable()
+	} else {
+		a.tray.toggle.Enable()
+	}
+
+	a.refreshTrayModes(state)
+}
+
+// refreshTrayModes puts the two mode items where the settings actually are.
+//
+// Read back from the state rather than left wherever the last click put them:
+// a change made on the Settings page has to show here too, and a change made
+// here that the backend refused — asking for a tunnel on a machine that cannot
+// raise one — must not leave a tick claiming otherwise.
+func (a *App) refreshTrayModes(state model.AppState) {
+	words := a.trayStrings()
+	settings := state.WhiteVPN
+
+	a.tray.systemProxy.SetTitle(words.systemProxy)
+	setChecked(a.tray.systemProxy, settings.SetSystemProxy)
+	// The tunnel carries the whole machine, so a proxy setting as well would be
+	// one hop too many and the connect path ignores it there. Disabled rather
+	// than left looking like a switch that does nothing.
+	if settings.TunEnabled {
+		a.tray.systemProxy.Disable()
+	} else {
+		a.tray.systemProxy.Enable()
+	}
+
+	a.tray.tunnel.SetTitle(words.tunnel)
+	setChecked(a.tray.tunnel, settings.TunEnabled)
+	// Mid-flight is the one time this should not be touched: it reconnects, and
+	// reconnecting something that is already connecting or stopping is how two
+	// engines end up fighting over one adapter.
+	switch state.Runtime.Status {
+	case model.RuntimeConnecting, model.RuntimeStopping:
+		a.tray.tunnel.Disable()
+	default:
+		a.tray.tunnel.Enable()
+	}
+}
+
+func setChecked(item *systray.MenuItem, checked bool) {
+	if checked {
+		item.Check()
+		return
+	}
+	item.Uncheck()
+}
+
+// toggleSystemProxyFromTray turns the machine's proxy setting on or off where
+// it stands.
+//
+// Live, and genuinely so: the system proxy is a setting on this machine, not
+// something the engine holds, so pointing it at the engine or putting it back
+// touches neither the core nor the connection to the server. Somebody who wants
+// their browser to stop going through the tunnel for a minute gets that without
+// losing the tunnel.
+//
+// It does nothing visible while the tunnel is up, because the tunnel carries
+// the whole machine and a proxy setting as well would be one hop too many —
+// which is why the connect path ignores it there. The item is disabled in that
+// state rather than lying about what it would do.
+func (a *App) toggleSystemProxyFromTray() {
+	a.mu.Lock()
+	settings := a.state.WhiteVPN
+	a.mu.Unlock()
+
+	next := settings
+	next.SetSystemProxy = !settings.SetSystemProxy
+	if _, err := a.SaveWhiteVPNSettings(next); err != nil {
+		a.appendRuntimeLog(fmt.Sprintf("could not change the system proxy setting: %v", err))
+		a.notifyTray()
+		return
+	}
+
+	// Applied to what is already running, which is the whole point of doing
+	// this from the tray. A change that only took effect on the next connection
+	// would be the Settings page again, in a smaller window.
+	state := a.GetAppState()
+	if state.Runtime.Status != model.RuntimeConnected || settings.TunEnabled {
+		a.notifyTray()
+		return
+	}
+	if next.SetSystemProxy {
+		if err := a.captureSystemProxy(state.Runtime.ListenPort); err != nil {
+			a.appendRuntimeLog(fmt.Sprintf("could not point this machine at the proxy: %v", err))
+		}
+	} else {
+		a.restoreSystemProxy()
+	}
+	a.notifyTray()
+}
+
+// toggleTunnelFromTray switches tunnel mode, and reconnects to do it.
+//
+// Unlike the system proxy this cannot be changed where it stands, and the
+// reason is not a shortcut taken here: a tunnel adapter needs Administrator, so
+// the engine is spawned elevated or not according to this setting, and a
+// process that is already running cannot be given or relieved of that. The
+// engine has to come up again.
+//
+// So the reconnect is automatic, and the menu item says so before it is clicked
+// rather than after. Doing it silently would drop somebody's connection with no
+// warning; making them do it by hand would be most of the inconvenience this is
+// meant to remove.
+func (a *App) toggleTunnelFromTray() {
+	a.mu.Lock()
+	settings := a.state.WhiteVPN
+	a.mu.Unlock()
+
+	next := settings
+	next.TunEnabled = !settings.TunEnabled
+	saved, err := a.SaveWhiteVPNSettings(next)
+	if err != nil {
+		a.appendRuntimeLog(fmt.Sprintf("could not change tunnel mode: %v", err))
+		a.notifyTray()
+		return
+	}
+	// settingsForThisMachine refuses the tunnel where there is no way to raise
+	// one, so asking for it can leave the setting where it was. Saying nothing
+	// would look like a menu item that does not work.
+	if saved.WhiteVPN.TunEnabled != next.TunEnabled {
+		a.appendRuntimeLog("tunnel mode is not available on this machine")
+		a.notifyTray()
+		return
+	}
+
+	if a.GetAppState().Runtime.Status != model.RuntimeConnected {
+		a.notifyTray()
+		return
+	}
+	a.appendRuntimeLog("tunnel mode changed — reconnecting to apply it")
+	if _, err := a.StopConnection(); err != nil {
+		a.appendRuntimeLog(fmt.Sprintf("could not disconnect to change tunnel mode: %v", err))
+		a.notifyTray()
+		return
+	}
+	if _, err := a.StartWhiteDNSVPNConnection(); err != nil {
+		a.appendRuntimeLog(fmt.Sprintf("could not reconnect after changing tunnel mode: %v", err))
+	}
+	a.notifyTray()
+}
+
+func (a *App) toggleFromTray() {
+	switch a.GetAppState().Runtime.Status {
+	case model.RuntimeConnected, model.RuntimeConnecting:
+		_, _ = a.StopConnection()
+	default:
+		_, _ = a.StartWhiteDNSVPNConnection()
+	}
+}
+
+func (a *App) showWindow() {
+	if a.ctx == nil {
+		return
+	}
+	wailsruntime.WindowShow(a.ctx)
+	wailsruntime.WindowUnminimise(a.ctx)
+}
+
+func (a *App) quitFromTray() {
+	systray.Quit()
+	if a.ctx != nil {
+		wailsruntime.Quit(a.ctx)
+		return
+	}
+	a.shutdown(context.Background())
+}
+
+// hideInsteadOfClosing is Wails' OnBeforeClose. Returning true keeps the window.
+func (a *App) hideInsteadOfClosing(ctx context.Context) bool {
+	// No icon to come back from: closing the window has to mean quitting, or the
+	// app becomes something only a process manager can end.
+	//
+	// Both halves are needed. running() says the library started; it does not say
+	// anything is drawing the result, and on Linux it always says yes — systray
+	// fires its ready callback before it has so much as opened the session bus.
+	// A GNOME user without an AppIndicator extension closed the window, watched
+	// the app vanish with no icon anywhere, and had to kill it from htop.
+	if !a.tray.running() || !trayIconIsDisplayed() {
+		return false
+	}
+	wailsruntime.WindowHide(ctx)
+	return true
+}
+
+const trayAppName = "WhiteVPN"
+
+type trayWords struct {
+	connected    string
+	connecting   string
+	stopping     string
+	disconnected string
+	failed       string
+	connect      string
+	disconnect   string
+	retry        string
+	show         string
+	quit         string
+	systemProxy  string
+	tunnel       string
+	tunnelHint   string
+}
+
+// The tray is drawn by the system, not by the page, so its words cannot come
+// from the interface's own translations. These are the same phrases, kept in
+// step with `frontend/src/i18n.ts` by hand — there are ten of them.
+func (a *App) trayStrings() trayWords {
+	english := trayWords{
+		connected:    "Connected",
+		connecting:   "Connecting…",
+		stopping:     "Disconnecting…",
+		disconnected: "Disconnected",
+		failed:       "Failed",
+		connect:      "Connect",
+		disconnect:   "Disconnect",
+		retry:        "Retry",
+		show:         "Open WhiteVPN",
+		quit:         "Quit",
+		systemProxy:  "System proxy",
+		tunnel:       "Tunnel mode",
+		// On the item itself, because this is the one that costs something and
+		// the cost should be visible before the click rather than after it.
+		tunnelHint: "Changing this reconnects",
+	}
+	if !strings.EqualFold(a.GetAppState().WhiteVPN.Language, "fa") {
+		return english
+	}
+	return trayWords{
+		connected:    "متصل",
+		connecting:   "در حال اتصال…",
+		stopping:     "در حال قطع اتصال…",
+		disconnected: "قطع",
+		failed:       "ناموفق",
+		connect:      "اتصال",
+		disconnect:   "قطع اتصال",
+		retry:        "تلاش دوباره",
+		show:         "باز کردن وایت‌وی‌پی‌ان",
+		quit:         "خروج",
+		systemProxy:  "پروکسی سیستم",
+		tunnel:       "حالت تونل",
+		tunnelHint:   "تغییر این گزینه اتصال را دوباره برقرار می‌کند",
+	}
+}
+
+func trayIcon() []byte {
+	if runtime.GOOS == "windows" {
+		return trayIconICO
+	}
+	return trayIconPNG
+}
+
+// onSecondInstanceLaunch runs in the instance that is already going, when
+// somebody starts the app again.
+//
+// Showing the window is the whole of it, and it is what the person clicking
+// wanted: on Windows an app whose window is hidden to the tray is
+// indistinguishable from one that is not running, so launching it again is the
+// obvious move rather than a mistake. The second process exits by itself once
+// this returns.
+//
+// The arguments the second launch carried are deliberately ignored. This app
+// takes none that mean anything — no file to open, no URL to handle — and
+// acting on an argument nobody defined would be inventing behaviour at the one
+// entry point that cannot be tested from the interface.
+func (a *App) onSecondInstanceLaunch(options.SecondInstanceData) {
+	a.showWindow()
+}

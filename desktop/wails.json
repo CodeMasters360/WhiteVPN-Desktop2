@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "WhiteVPN Desktop",
+  "outputfilename": "WhiteVPN Desktop",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "WhiteDNS",
+    "email": ""
+  },
+  "info": {
+    "companyName": "WhiteDNS",
+    "productName": "WhiteVPN Desktop",
+    "productVersion": "0.0.0",
+    "copyright": "GPL-3.0-or-later",
+    "comments": "https://github.com/WhiteDNS/WhiteVPN-Desktop"
+  }
+}
