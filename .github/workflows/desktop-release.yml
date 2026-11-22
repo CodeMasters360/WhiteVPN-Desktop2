@@ -343,7 +343,7 @@ jobs:
           echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
 
       - name: Publish to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
